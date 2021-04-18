@@ -1,62 +1,63 @@
-  
-global httprecrdTable :table[addr] of set[time,count,string] ;
+@load base/frameworks/sumstats
 
-global mintimeTable :table[addr] of time = {};
-global maxtimeTable :table[addr] of time = {};
-global replycounterIn10MinsTable :table[addr] of count = {};
-global _400counterIn10MinsTable :table[addr] of count = {};
-global urlsetIn10MinsTable: table[addr] of set[string] = {};
+global a:set[addr];
+global b:set[addr];
+global all: table[addr] of double;
+global err: table[addr] of double;
+global uri: table[addr] of set[string];
+event zeek_init()
+    {
+    local r1 = SumStats::Reducer($stream = "all response", $apply = set(SumStats::SUM));
+    local r2 = SumStats::Reducer($stream = "404 response", $apply = set(SumStats::SUM));
+    SumStats::create([$name="all response",
+                      $epoch=10mins,
+                      $reducers=set(r1),
+                      $epoch_result(ts: time, key: SumStats::Key, result: SumStats::Result) =
+                        {
+                        local r = result["all response"];
+                        if (!(key$host in a))
+						{
+							add a[key$host];
+							all[key$host] = r$sum;
+						}
+						else
+							all[key$host] = all[key$host] + r$sum;
+                        }]);
+    
+    SumStats::create([$name="404 response",
+                      $epoch=10mins,
+                      $reducers=set(r2),
+                      $epoch_result(ts: time, key: SumStats::Key, result: SumStats::Result) =
+                        {
+                        local r = result["404 response"];
+                        if (!(key$host in b))
+						{
+							add b[key$host];
+							err[key$host] = r$sum;
+							uri[key$host] = set();
+						}
+						else
+							err[key$host] = err[key$host] + r$sum;
+						if (!(key$str in uri[key$host]))
+							add uri[key$host][key$str];
+                        }]);
+    }
 
-global problemIP :set[string] = {};
-
-event http_reply(c: connection, version: string, code: count, reason: string)
-{
-	local t1 = network_time();
-	
-	if(c$id$orig_h in httprecrdTable)
+event http_reply(c: connection, version: string, code: count, reason:string)
 	{
-		add httprecrdTable[c$id$orig_h][t1,code,c$http$uri];
-	
-		if (t1 > maxtimeTable[c$id$orig_h]){maxtimeTable[c$id$orig_h]=t1;}
-		++replycounterIn10MinsTable[c$id$orig_h];
-		if (code == 404){++_400counterIn10MinsTable[c$id$orig_h];}
-		if (c$http$uri !in urlsetIn10MinsTable[c$id$orig_h]){ add urlsetIn10MinsTable[c$id$orig_h][c$http$uri];}
+	SumStats::observe("all response", SumStats::Key($host=c$id$orig_h, $str=c$http$uri), SumStats::Observation($num=1));
+	if (code == 404)
+		SumStats::observe("404 response", SumStats::Key($host=c$id$orig_h, $str=c$http$uri), SumStats::Observation($num=1));
 	}
-	else
-	{
-		local a :set[time,count,string];
-		local b :set[string];
-		local d :set[string];
-		
-		httprecrdTable[c$id$orig_h] = a;
-		add httprecrdTable[c$id$orig_h][t1,code,c$http$uri];
-		
-		mintimeTable[c$id$orig_h] = t1;
-		maxtimeTable[c$id$orig_h] = t1;
-		replycounterIn10MinsTable[c$id$orig_h] = 1;
-		if ( code == 404 ){_400counterIn10MinsTable[c$id$orig_h]=1;}
-		else{_400counterIn10MinsTable[c$id$orig_h]=0;}
-		
-		urlsetIn10MinsTable[c$id$orig_h] = b;
-		add urlsetIn10MinsTable[c$id$orig_h][c$http$uri];
-	}
-	
-	if (maxtimeTable[c$id$orig_h] - mintimeTable[c$id$orig_h] > 10mins)
-	{
-		if(_400counterIn10MinsTable[c$id$orig_h]>2)
-			if(_400counterIn10MinsTable[c$id$orig_h]/replycounterIn10MinsTable[c$id$orig_h]>0.2)
-				if(|urlsetIn10MinsTable[c$id$orig_h]|/_400counterIn10MinsTable[c$id$orig_h]>0.5)
-				{
-					print fmt("%s is a scanner with %d scan attemps on %d urls",c$id$orig_h,_400counterIn10MinsTable[c$id$orig_h],|urlsetIn10MinsTable[c$id$orig_h]|);
-					mintimeTable[c$id$orig_h]=maxtimeTable[c$id$orig_h];
-					replycounterIn10MinsTable[c$id$orig_h]=0;
-					_400counterIn10MinsTable[c$id$orig_h]=0;
-					urlsetIn10MinsTable[c$id$orig_h]=d;
-				}
-	}
-}
-
 
 event zeek_done()
-{
-}
+	{
+	for (i in a)
+	{
+		if (i in b)
+			if (err[i] > 2)
+				if (err[i] / all[i] > 0.2)
+					if (|uri[i]|/err[i] > 0.5)
+						print fmt("%s is a scanner with %.0f scan attemps on %d urls", i, err[i], |uri[i]|);
+	}
+	}
